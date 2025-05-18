@@ -34,6 +34,7 @@ struct erofsfsck_cfg {
 	bool preserve_owner;
 	bool preserve_perms;
 	bool dump_xattrs;
+	char *layout_info;
 };
 static struct erofsfsck_cfg fsckcfg;
 
@@ -53,6 +54,7 @@ static struct option long_options[] = {
 	{"offset", required_argument, 0, 12},
 	{"xattrs", no_argument, 0, 13},
 	{"no-xattrs", no_argument, 0, 14},
+	{"blocks-layout", required_argument, 0, 15},
 	{0, 0, 0, 0},
 };
 
@@ -106,6 +108,9 @@ static void usage(int argc, char **argv)
 		" --[no-]xattrs          whether to dump extended attributes (default off)\n"
 		"\n"
 		" -a, -A, -y             no-op, for compatibility with fsck of other filesystems\n"
+		" --blocks-layout=X      Generate layout info of physical blocks to X\n"
+		"                        Try to run scripts/layoutInfo.py to get sorted \n"
+		"                        block addresses and sizes on X\n"
 		"\n"
 		"Extraction options (--extract=X is required):\n"
 		" --force                allow extracting to root\n"
@@ -236,6 +241,35 @@ static int erofsfsck_parse_options_cfg(int argc, char **argv)
 			break;
 		case 14:
 			fsckcfg.dump_xattrs = false;
+			break;
+		case 15:
+			if (optarg) {
+				size_t len = strlen(optarg);
+
+				if (len == 0) {
+					erofs_err("empty value given for --extract=X");
+					return -EINVAL;
+				}
+
+				/* remove trailing slashes except root */
+				while (len > 1 && optarg[len - 1] == '/')
+					len--;
+
+				if (len >= PATH_MAX) {
+					erofs_err("target directory name too long!");
+					return -ENAMETOOLONG;
+				}
+
+				fsckcfg.layout_info = malloc(PATH_MAX);
+				if (!fsckcfg.layout_info)
+					return -ENOMEM;
+				strncpy(fsckcfg.layout_info, optarg, len);
+				fsckcfg.layout_info[len] = '\0';
+				/* if path is root, start writing from position 0 */
+				if (len == 1 && fsckcfg.layout_info[0] == '/')
+					len = 0;
+				fsckcfg.extract_pos = len;
+			}
 			break;
 		default:
 			return -EINVAL;
@@ -512,6 +546,26 @@ out:
 	return ret;
 }
 
+static int save_layout_data(erofs_off_t addr, u64 blksize)
+{
+	int fd;
+	fd = open(fsckcfg.layout_info, O_WRONLY | O_APPEND | O_CREAT, 0644);
+	if (fd == -1) {
+		erofs_err("Failed to open file: %s\n", fsckcfg.layout_info);
+		return -1;
+	}
+
+	if (dprintf(fd, "%ld %ld\n", addr, blksize) < 0) {
+		erofs_err("Failed to write data\n");
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
+
+	return 0;
+}
+
 static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 {
 	struct erofs_map_blocks map = {
@@ -648,6 +702,13 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 		if (!erofs_is_packed_inode(inode))
 			fsckcfg.logical_blocks += BLK_ROUND_UP(inode->sbi, inode->i_size);
 		fsckcfg.physical_blocks += BLK_ROUND_UP(inode->sbi, pchunk_len);
+	}
+
+	if (fsckcfg.layout_info != NULL) {
+	       ret = save_layout_data(map.m_pa, map.m_plen);
+	       if (ret < 0)
+		       goto out;
+	       erofs_update_progressinfo("Physical layout data saved in %s\n", fsckcfg.layout_info);
 	}
 out:
 	if (raw)
