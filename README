@@ -1,6 +1,9 @@
 erofs-utils
 ===========
 
+[![Last Commit](https://img.shields.io/github/last-commit/erofs/erofs-utils/dev)](https://github.com/erofs/erofs-utils/commits/dev)
+[![License](https://img.shields.io/badge/License-GPL--2.0%20or%20Apache--2.0-blue)](COPYING)
+
 Userspace tools for EROFS filesystem, currently including:
 
   mkfs.erofs    filesystem formatter
@@ -9,6 +12,7 @@ Userspace tools for EROFS filesystem, currently including:
   dump.erofs    filesystem analyzer
   fsck.erofs    filesystem compatibility & consistency checker as well
                 as extractor
+
 
 
 EROFS filesystem overview
@@ -48,6 +52,61 @@ For more details on how to build erofs-utils, see `docs/INSTALL.md`.
 
 For more details about filesystem performance, see
 `docs/PERFORMANCE.md`.
+
+Quick Start: Build, Create, Mount, and Verify an EROFS Image
+------------------------------------------------------------
+
+1. Install dependencies:
+   ```bash
+   sudo apt update
+   sudo apt install -y autoconf automake libtool pkg-config \
+       libfuse-dev liblz4-dev liblzma-dev libzstd-dev uuid-dev zlib1g-dev
+   ```
+
+2. Clone and build:
+   ```bash
+   git clone https://github.com/erofs/erofs-utils.git
+   cd erofs-utils
+   ./autogen.sh
+   ./configure --enable-lz4 --enable-lzma --enable-fuse --with-libzstd [--enable-multithreading]
+   make -j$(nproc)
+   ```
+
+3. Create a simple test image:
+   ```bash
+   mkdir src_dir
+   echo "Hello, EROFS world!" > src_dir/hello.txt
+   echo "This is a test file." > src_dir/test.txt
+   ./mkfs/mkfs.erofs test.img src_dir/
+   ```
+
+4. Verify integrity:
+   ```bash
+   ./fsck/fsck.erofs test.img
+   # Expected output: "No errors found" or filesystem statistics (no error messages)
+   ```
+
+5. Mount and explore (using FUSE — no kernel module required):
+   ```bash
+   mkdir mnt
+   ./fuse/erofsfuse test.img mnt/
+   ls mnt/                # Should list hello.txt and test.txt
+   cat mnt/hello.txt      # Hello, EROFS world!
+   fusermount -u mnt/     # Unmount when done
+   ```
+
+6. Clean up:
+   ```bash
+   rm -rf src_dir mnt test.img
+   ```
+
+7. Compressed images:
+   ```bash
+   ./mkfs/mkfs.erofs -zlz4hc test-compressed.img src_dir/
+   ```
+   For compressed images, add e.g. `-zlz4hc` or `-zzstd` (or other algorithms) to `mkfs.erofs`.
+   See the `mkfs.erofs` section below for advanced options (big pclusters,
+   multi-algorithms, reproducible builds, etc.).
 
 
 mkfs.erofs
@@ -281,6 +340,14 @@ erofs-utils is a part of EROFS filesystem project, which is completely
 community-driven open source software.  If you have interest in EROFS,
 feel free to send feedback and/or patches to:
   linux-erofs mailing list   <linux-erofs@lists.ozlabs.org>
+
+
+Upstream and Community
+----------------------
+
+- Canonical upstream: https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git
+- Discussion / patches: linux-erofs@lists.ozlabs.org (subscribe: https://lists.ozlabs.org/listinfo/linux-erofs)
+- Kernel docs: https://www.kernel.org/doc/html/next/filesystems/erofs.html
 
 
 Comments
