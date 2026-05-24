@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 
+"""
+Helper python script to show the compressed block information in easy to understand and debug format
+Usage:
+    ./fsck.erofs --blocks-layout=blocksinfo image.erofs
+    python3 ./scripts/layoutInfo.py blocksinfo
+"""
+
 import sys
 
 def main():
