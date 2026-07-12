@@ -43,6 +43,7 @@ int __erofs_fill_inode(struct erofs_inode *inode, struct stat *st,
 struct erofs_inode *erofs_new_inode(struct erofs_sb_info *sbi);
 struct erofs_inode *erofs_mkfs_build_tree_from_path(struct erofs_sb_info *sbi,
 						    const char *path);
+unsigned int erofs_mkfs_count_source_files(const char *path);
 struct erofs_inode *erofs_mkfs_build_special_from_fd(struct erofs_sb_info *sbi,
 						     int fd, const char *name);
 int erofs_fixup_root_inode(struct erofs_inode *root);

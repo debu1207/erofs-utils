@@ -1587,6 +1587,7 @@ static int erofs_mkfs_handle_inode(struct erofs_inode *inode)
 					      sizeof("Processing  ...") - 1);
 	erofs_update_progressinfo("Processing %s ...", trimmed);
 	free(trimmed);
+	erofs_progress_file_processed();
 
 	ret = erofs_scan_file_xattrs(inode);
 	if (ret < 0)
@@ -1631,6 +1632,7 @@ static int erofs_rebuild_handle_inode(struct erofs_inode *inode,
 					      sizeof("Processing  ...") - 1);
 	erofs_update_progressinfo("Processing %s ...", trimmed);
 	free(trimmed);
+	erofs_progress_file_processed();
 
 	if (erofs_should_use_inode_extended(inode, inode->i_srcpath)) {
 		if (cfg.c_force_inodeversion == FORCE_INODE_COMPACT) {
@@ -1896,6 +1898,46 @@ fail:
 	return err;
 }
 #endif
+
+unsigned int erofs_mkfs_count_source_files(const char *path)
+{
+	DIR *dir;
+	struct dirent *dp;
+	struct stat st;
+	unsigned int count = 1;
+
+	dir = opendir(path);
+	if (!dir)
+		return 1;
+
+	while (1) {
+		char buf[PATH_MAX];
+
+		errno = 0;
+		dp = readdir(dir);
+		if (!dp) {
+			if (!errno)
+				break;
+			continue;
+		}
+
+		if (is_dot_dotdot(dp->d_name))
+			continue;
+
+		if (erofs_is_exclude_path(path, dp->d_name))
+			continue;
+
+		snprintf(buf, sizeof(buf), "%s/%s", path, dp->d_name);
+		if (lstat(buf, &st))
+			continue;
+
+		++count;
+		if (S_ISDIR(st.st_mode))
+			count += erofs_mkfs_count_source_files(buf);
+	}
+	closedir(dir);
+	return count-1;
+}
 
 struct erofs_inode *erofs_mkfs_build_tree_from_path(struct erofs_sb_info *sbi,
 						    const char *path)

@@ -111,6 +111,46 @@ int erofs_selabel_open(const char *file_contexts)
 #endif
 
 static bool __erofs_is_progressmsg;
+static unsigned int __erofs_progress;
+static unsigned int __erofs_total_files;
+static unsigned int __erofs_processed_files;
+
+static int erofs_get_terminal_width(void)
+{
+#ifdef GWINSZ_IN_SYS_IOCTL
+	struct winsize winsize;
+
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &winsize) >= 0 &&
+	    winsize.ws_col > 0)
+		return winsize.ws_col;
+#endif
+	return 80;
+}
+
+void erofs_progress_init(unsigned int total)
+{
+	__erofs_total_files = total;
+	__erofs_processed_files = 0;
+	__erofs_progress = 0;
+}
+
+void erofs_progress_file_processed(void)
+{
+	__erofs_processed_files++;
+	if (__erofs_total_files > 0)
+		__erofs_progress = min_t(unsigned int,
+			 __erofs_processed_files * 100 / __erofs_total_files, 100);
+}
+
+unsigned int erofs_progress_get_processed(void)
+{
+	return __erofs_processed_files;
+}
+
+unsigned int erofs_progress_get_total(void)
+{
+	return __erofs_total_files;
+}
 
 char *erofs_trim_for_progressinfo(const char *str, int placeholder)
 {
@@ -119,16 +159,10 @@ char *erofs_trim_for_progressinfo(const char *str, int placeholder)
 	if (!erofs_stdout_tty) {
 		return strdup(str);
 	} else {
-#ifdef GWINSZ_IN_SYS_IOCTL
-		struct winsize winsize;
-
-		if(ioctl(STDOUT_FILENO, TIOCGWINSZ, &winsize) >= 0 &&
-		   winsize.ws_col > 0)
-			col = winsize.ws_col;
-		else
-#endif
-			col = 80;
+		col = erofs_get_terminal_width();
 	}
+	if (cfg.c_showprogress && cfg.c_dbg_lvl < EROFS_INFO)
+		placeholder += sizeof("[100%] [#####################################################] ") - 1;
 
 	if (col <= placeholder)
 		return strdup("");
@@ -174,13 +208,33 @@ void erofs_update_progressinfo(const char *fmt, ...)
 	va_end(ap);
 
 	if (erofs_stdout_tty) {
-		printf("\r\033[K%s", msg);
+		int col, bar_width, prefix_len, msg_len;
+		unsigned int i, filled;
+
+		col = erofs_get_terminal_width();
+		prefix_len = sizeof("[100%] [") - 1;
+		msg_len = strlen(msg);
+
+		bar_width = col - prefix_len - 2 - msg_len - 1;
+		if (bar_width < 10)
+			bar_width = 10;
+
+		printf("\r\033[K[%3u%%] [", __erofs_progress);
+		filled = __erofs_progress * bar_width / 100;
+		for (i = 0; i < bar_width; ++i)
+			putchar(i < filled ? '#' : '-');
+		printf("] %s", msg);
 		__erofs_is_progressmsg = true;
 		fflush(stdout);
 		return;
 	}
 	fputs(msg, stdout);
 	fputc('\n', stdout);
+}
+
+void erofs_update_progress(unsigned int percentage)
+{
+	__erofs_progress = min_t(unsigned int, percentage, 100);
 }
 
 unsigned int erofs_get_available_processors(void)

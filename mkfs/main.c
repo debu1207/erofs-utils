@@ -1479,6 +1479,8 @@ int main(int argc, char **argv)
 		if (err)
 			goto exit;
 	} else {
+		unsigned int total_files;
+
 		err = erofs_build_shared_xattrs_from_path(&g_sbi, cfg.c_src_path);
 		if (err) {
 			erofs_err("failed to build shared xattrs: %s",
@@ -1489,6 +1491,8 @@ int main(int argc, char **argv)
 		if (cfg.c_extra_ea_name_prefixes)
 			erofs_xattr_flush_name_prefixes(&g_sbi);
 
+		total_files = erofs_mkfs_count_source_files(cfg.c_src_path);
+		erofs_progress_init(total_files);
 		root = erofs_mkfs_build_tree_from_path(&g_sbi, cfg.c_src_path);
 		if (IS_ERR(root)) {
 			err = PTR_ERR(root);
