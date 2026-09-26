@@ -35,21 +35,26 @@ int erofs_load_shared_xattrs_from_path(struct erofs_sb_info *sbi, const char *pa
 int erofs_xattr_insert_name_prefix(const char *prefix);
 int erofs_xattr_set_ishare_prefix(struct erofs_sb_info *sbi,
 				  const char *prefix);
+char *erofs_xattr_get_ishare_prefix(struct erofs_sb_info *sbi);
 void erofs_xattr_cleanup_name_prefixes(void);
 int erofs_xattr_flush_name_prefixes(struct erofs_importer *im, bool plain);
 int erofs_xattr_prefixes_init(struct erofs_sb_info *sbi);
+int __erofs_getxattr(struct erofs_inode *vi, const char *name,
+		     char *buffer, size_t buffer_size, bool hidden);
 int erofs_setxattr(struct erofs_inode *inode, int index, const char *name,
 		   const void *value, size_t size);
 int erofs_vfs_setxattr(struct erofs_inode *inode, const char *name,
 		       const void *value, size_t size);
 int erofs_set_opaque_xattr(struct erofs_inode *inode);
 void erofs_clear_opaque_xattr(struct erofs_inode *inode);
+bool erofs_get_opaque_from_disk(struct erofs_inode *inode);
 int erofs_set_origin_xattr(struct erofs_inode *inode);
 int erofs_read_xattrs_from_disk(struct erofs_inode *inode);
 
 bool erofs_xattr_prefix_matches(const char *key, unsigned int *index,
 				unsigned int *len);
 void erofs_xattr_exit(struct erofs_sb_info *sbi);
+void erofs_inode_free_xattrs(struct erofs_inode *inode);
 
 #ifdef __cplusplus
 }

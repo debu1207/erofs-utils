@@ -24,8 +24,8 @@
 #include "erofs/exclude.h"
 #include "erofs/block_list.h"
 #include "erofs/compress_hints.h"
-#include "erofs/blobchunk.h"
 #include "../lib/compressor.h"
+#include "../lib/liberofs_chunk.h"
 #include "../lib/liberofs_gzran.h"
 #include "../lib/liberofs_metabox.h"
 #include "../lib/liberofs_oci.h"
@@ -33,6 +33,8 @@
 #include "../lib/liberofs_rebuild.h"
 #include "../lib/liberofs_s3.h"
 #include "../lib/liberofs_uuid.h"
+
+#define EROFS_EA_INODE_DIGEST_DEFAULT "erofs.fingerprint.v1"
 
 static struct option long_options[] = {
 	{"version", no_argument, 0, 'V'},
@@ -102,7 +104,7 @@ static struct option long_options[] = {
 	{"zD", optional_argument, NULL, 536},
 	{"MZ", optional_argument, NULL, 537},
 	{"xattr-prefix", required_argument, NULL, 538},
-	{"xattr-inode-digest", required_argument, NULL, 539},
+	{"xattr-inode-digest", optional_argument, NULL, 539},
 	{0, 0, 0, 0},
 };
 
@@ -256,7 +258,7 @@ static void usage(int argc, char **argv)
 #ifdef EROFS_MT_ENABLED
 		" --workers=#            set the number of worker threads to # (default: %u)\n"
 #endif
-		" --xattr-inode-digest=X specify extended attribute name X to record inode digests\n"
+		" --xattr-inode-digest=X specify extended attribute name X (\"" EROFS_EA_INODE_DIGEST_DEFAULT "\" if omitted) to record inode digests\n"
 		" --xattr-prefix=X       X=extra xattr name prefix\n"
 		" --zfeature-bits=#      toggle filesystem compression features according to given bits #\n"
 #ifdef WITH_ANDROID
@@ -280,9 +282,11 @@ static void version(void)
 
 static struct erofsmkfs_cfg {
 	struct z_erofs_paramset zcfgs[EROFS_MAX_COMPR_CFGS + 1];
+	char *blobdev_path;
 	/* < 0, xattr disabled and >= INT_MAX, always use inline xattrs */
 	long inlinexattr_tolerance;
 	bool inode_metazone;
+	char chunkbits;
 	u64 unix_timestamp;
 	unsigned int total_zcfgs;
 } mkfscfg = {
@@ -1226,7 +1230,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 #endif
 		case 'C':
 			err = erofs_mkfs_strtol(optarg, &endptr, &i, 0);
-			if (err < 0 || *endptr != '\0' || i <= 0) {
+			if (err || *endptr != '\0' || i <= 0) {
 				erofs_err("invalid physical clustersize %s",
 					  optarg);
 				return -EINVAL;
@@ -1248,7 +1252,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				}
 			}
 			err = erofs_mkfs_strtol(optarg, &endptr, &i, 0);
-			if (err < 0 || (*endptr != '\0' && algid != endptr) ||
+			if (err || (*endptr != '\0' && algid != endptr) ||
 			    i <= 0) {
 				erofs_err("invalid metabox option %s", optarg);
 				return -EINVAL;
@@ -1263,8 +1267,8 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 				erofs_err("invalid chunksize %s", optarg);
 				return -EINVAL;
 			}
-			cfg.c_chunkbits = ilog2(i);
-			if ((1 << cfg.c_chunkbits) != i) {
+			mkfscfg.chunkbits = ilog2(i);
+			if ((1 << mkfscfg.chunkbits) != i) {
 				erofs_err("chunksize %s must be a power of two",
 					  optarg);
 				return -EINVAL;
@@ -1275,7 +1279,7 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			quiet = true;
 			break;
 		case 13:
-			cfg.c_blobdev_path = optarg;
+			mkfscfg.blobdev_path = optarg;
 			break;
 		case 14:
 			params->ignore_mtime = true;
@@ -1483,6 +1487,8 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 			cfg.c_extra_ea_name_prefixes = true;
 			break;
 		case 539:
+			if (!optarg)
+				optarg = EROFS_EA_INODE_DIGEST_DEFAULT;
 			err = erofs_xattr_set_ishare_prefix(&g_sbi, optarg);
 			if (err < 0) {
 				erofs_err("failed to parse ishare name: %s",
@@ -1502,13 +1508,8 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		}
 	}
 
-	if (cfg.c_blobdev_path && cfg.c_chunkbits < mkfs_blkszbits) {
-		erofs_err("--blobdev must be used together with --chunksize");
-		return -EINVAL;
-	}
-
 	/* TODO: can be implemented with (deviceslot) mapped_blkaddr */
-	if (cfg.c_blobdev_path &&
+	if (mkfscfg.blobdev_path &&
 	    cfg.c_force_chunkformat == FORCE_INODE_BLOCK_MAP) {
 		erofs_err("--blobdev cannot work with block map currently");
 		return -EINVAL;
@@ -1527,6 +1528,11 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		err = mkfs_parse_sources(argc, argv, optind);
 		if (err)
 			return err;
+
+		if (mkfscfg.blobdev_path && source_mode == EROFS_MKFS_SOURCE_REBUILD) {
+			erofs_err("--blobdev is currently incompatible with rebuild mode");
+			return -EINVAL;
+		}
 	} else if (source_mode != EROFS_MKFS_SOURCE_TAR) {
 		erofs_err("missing argument: SOURCE(s)");
 		return -EINVAL;
@@ -1560,9 +1566,9 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 		params->pclusterblks_max = pclustersize_max >> mkfs_blkszbits;
 		params->pclusterblks_def = params->pclusterblks_max;
 	}
-	if (cfg.c_chunkbits && cfg.c_chunkbits < mkfs_blkszbits) {
+	if (mkfscfg.chunkbits && mkfscfg.chunkbits < mkfs_blkszbits) {
 		erofs_err("chunksize %u must be larger than block size",
-			  1u << cfg.c_chunkbits);
+			  1u << mkfscfg.chunkbits);
 		return -EINVAL;
 	}
 
@@ -1575,10 +1581,10 @@ static int mkfs_parse_options_cfg(struct erofs_importer_params *params,
 	 * unaligned. Therefore, let's issue a warning here and still skip
 	 * alignment for now.
 	 */
-	if (cfg.c_chunkbits && dsunit &&
-	    (1u << (cfg.c_chunkbits - g_sbi.blkszbits)) < dsunit) {
+	if (mkfscfg.chunkbits && dsunit &&
+	    (1u << (mkfscfg.chunkbits - g_sbi.blkszbits)) < dsunit) {
 		erofs_warn("chunksize %u bytes is smaller than dsunit %u blocks, ignore dsunit !",
-			   1u << cfg.c_chunkbits, dsunit);
+			   1u << mkfscfg.chunkbits, dsunit);
 	}
 
 	if (pclustersize_packed) {
@@ -1681,12 +1687,12 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 		ret = erofs_rebuild_load_tree(root, src, datamode);
 		src->xamgr = NULL;
 		if (ret) {
-			erofs_err("failed to load %s", src->devname);
+			erofs_err("failed to load %s", src->dif0.src_path);
 			return ret;
 		}
 		if (src->extra_devices > 1) {
 			erofs_err("%s: unsupported number %u of extra devices",
-				  src->devname, src->extra_devices);
+				  src->dif0.src_path, src->extra_devices);
 			return -EOPNOTSUPP;
 		}
 		extra_devices += src->extra_devices;
@@ -1719,8 +1725,8 @@ static int erofs_mkfs_rebuild_load_trees(struct erofs_inode *root)
 			nblocks = src->devs[0].blocks;
 			tag = src->devs[0].tag;
 		} else {
-			nblocks = src->primarydevice_blocks;
-			devs[idx].src_path = strdup(src->devname);
+			nblocks = src->dif0.blocks;
+			devs[idx].src_path = strdup(src->dif0.src_path);
 		}
 		devs[idx].blocks = nblocks;
 		if (tag && *tag)
@@ -1845,7 +1851,7 @@ int main(int argc, char **argv)
 			goto exit;
 		err = erofs_read_superblock(src);
 		if (err) {
-			erofs_err("failed to read superblock of %s", src->devname);
+			erofs_err("failed to read superblock of %s", src->dif0.src_path);
 			goto exit;
 		}
 		mkfs_blkszbits = src->blkszbits;
@@ -1892,38 +1898,53 @@ int main(int argc, char **argv)
 	importer_params.source = cfg.c_src_path;
 	importer_params.no_datainline = mkfs_no_datainline;
 	importer_params.dot_omitted = mkfs_dot_omitted;
+	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON &&
+	    !mkfscfg.chunkbits && !mkfscfg.total_zcfgs) {
+		erofs_err("Compression is not enabled.  Turn on chunk-based data deduplication instead.");
+		mkfscfg.chunkbits = g_sbi.blkszbits;
+	}
+	importer_params.chunkszbits_def = mkfscfg.chunkbits;
 	err = erofs_importer_init(&importer);
 	if (err)
 		goto exit;
 
-	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON) {
-		if (!g_sbi.available_compr_algs) {
-			erofs_err("Compression is not enabled.  Turn on chunk-based data deduplication instead.");
-			cfg.c_chunkbits = g_sbi.blkszbits;
-		} else {
-			err = z_erofs_dedupe_init(erofs_blksiz(&g_sbi));
-			if (err) {
-				erofs_err("failed to initialize deduplication: %s",
-					  erofs_strerror(err));
-				goto exit;
-			}
+	if (importer_params.dedupe == EROFS_DEDUPE_FORCE_ON &&
+	    g_sbi.available_compr_algs) {
+		err = z_erofs_dedupe_init(erofs_blksiz(&g_sbi));
+		if (err) {
+			erofs_err("failed to initialize deduplication: %s",
+				  erofs_strerror(err));
+			goto exit;
 		}
 	}
 
 	cfg.c_dedupe = importer_params.dedupe;
-	if (cfg.c_chunkbits) {
-		err = erofs_blob_init(cfg.c_blobdev_path, 1 << cfg.c_chunkbits);
-		if (err)
-			goto exit;
-	}
-
-	if (tar_index_512b || cfg.c_blobdev_path) {
+	if (tar_index_512b || mkfscfg.blobdev_path) {
 		err = erofs_mkfs_init_devices(&g_sbi, 1);
 		if (err) {
 			erofs_err("failed to generate device table: %s",
 				  erofs_strerror(err));
 			goto exit;
 		}
+		if (mkfscfg.blobdev_path) {
+			g_sbi.devs[0].src_path = strdup(mkfscfg.blobdev_path);
+			if (!g_sbi.devs[0].src_path) {
+				err = -ENOMEM;
+				goto exit;
+			}
+
+			err = erofs_blob_init_device(&g_sbi, 1);
+			if (err)
+				goto exit;
+
+		}
+		importer_params.ddev_id_def = mkfscfg.blobdev_path ? 1 : 0;
+	}
+
+	if (tar_index_512b || mkfscfg.chunkbits) {
+		err = erofs_blob_init(&g_sbi, mkfscfg.chunkbits);
+		if (err)
+			goto exit;
 	}
 
 	if (source_mode == EROFS_MKFS_SOURCE_LOCALDIR) {
@@ -2031,12 +2052,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (erofstar.index_mode || cfg.c_chunkbits || g_sbi.extra_devices) {
-		err = erofs_mkfs_dump_blobs(&g_sbi);
-		if (err)
-			goto exit;
-	}
-
 	err = erofs_importer_flush_all(&importer);
 	if (err)
 		goto exit;
@@ -2047,8 +2062,7 @@ int main(int argc, char **argv)
 	if (err)
 		goto exit;
 
-	err = erofs_dev_resize(&g_sbi, g_sbi.primarydevice_blocks);
-
+	err = erofs_flush_all_devices(&g_sbi);
 	if (!err && erofs_sb_has_sb_chksum(&g_sbi)) {
 		err = erofs_enable_sb_chksum(&g_sbi, &crc);
 		if (!err)
@@ -2068,8 +2082,6 @@ exit:
 		fclose(blklst);
 	erofs_cleanup_compress_hints();
 	erofs_cleanup_exclude_rules();
-	if (cfg.c_chunkbits || source_mode == EROFS_MKFS_SOURCE_REBUILD)
-		erofs_blob_exit();
 	erofs_xattr_cleanup_name_prefixes();
 	erofs_rebuild_cleanup();
 	erofs_diskbuf_exit();

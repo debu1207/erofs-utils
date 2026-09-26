@@ -400,17 +400,43 @@ static struct erofs_xattritem *erofs_get_selabel_xattr(struct erofs_sb_info *sbi
 	return NULL;
 }
 
+static int erofs_comp_xattritem(const void *a, const void *b)
+{
+	const struct erofs_xattritem *ia, *ib;
+	unsigned int la, lb;
+	int ret;
+
+	ia = *((const struct erofs_xattritem **)a);
+	ib = *((const struct erofs_xattritem **)b);
+	la = EROFS_XATTR_KVSIZE(ia->len);
+	lb = EROFS_XATTR_KVSIZE(ib->len);
+
+	ret = memcmp(ia->kvbuf, ib->kvbuf, min(la, lb));
+	if (ret != 0)
+		return ret;
+	return cmpsgn(la, lb);
+}
+
 static int erofs_inode_xattr_add(struct list_head *hlist,
 				 struct erofs_xattritem *item)
 {
-	struct erofs_inode_xattr_node *node;
+	struct erofs_inode_xattr_node *node, *pos;
 
 	node = malloc(sizeof(*node));
 	if (!node)
 		return -ENOMEM;
 	init_list_head(&node->list);
 	node->item = item;
-	list_add(&node->list, hlist);
+
+	/*
+	 * Order each inode's xattrs by name so that images stay reproducible.
+	 * listxattr(2) makes no promise about the order it reports, and
+	 * filesystems disagree: insertion order, on-disk order, or random.
+	 */
+	list_for_each_entry(pos, hlist, list)
+		if (erofs_comp_xattritem(&item, &pos->item) < 0)
+			break;
+	list_add_tail(&node->list, &pos->list);
 	return 0;
 }
 
@@ -574,6 +600,11 @@ int erofs_set_opaque_xattr(struct erofs_inode *inode)
 void erofs_clear_opaque_xattr(struct erofs_inode *inode)
 {
 	erofs_removexattr(inode, OVL_XATTR_OPAQUE);
+}
+
+bool erofs_get_opaque_from_disk(struct erofs_inode *inode)
+{
+	return (erofs_getxattr(inode, OVL_XATTR_OPAQUE, NULL, 0) >= 0);
 }
 
 int erofs_set_origin_xattr(struct erofs_inode *inode)
@@ -843,24 +874,6 @@ static unsigned int erofs_cleanxattrs(struct erofs_xattrmgr *xamgr,
 	return count;
 }
 
-static int comp_shared_xattritem(const void *a, const void *b)
-{
-	const struct erofs_xattritem *ia, *ib;
-	unsigned int la, lb;
-	int ret;
-
-	ia = *((const struct erofs_xattritem **)a);
-	ib = *((const struct erofs_xattritem **)b);
-	la = EROFS_XATTR_KVSIZE(ia->len);
-	lb = EROFS_XATTR_KVSIZE(ib->len);
-
-	ret = memcmp(ia->kvbuf, ib->kvbuf, min(la, lb));
-	if (ret != 0)
-		return ret;
-
-	return la > lb;
-}
-
 int erofs_xattr_flush_name_prefixes(struct erofs_importer *im, bool plain)
 {
 	const struct erofs_importer_params *params = im->params;
@@ -1010,7 +1023,7 @@ int erofs_load_shared_xattrs_from_path(struct erofs_sb_info *sbi, const char *pa
 	}
 	DBG_BUGON(i != sharedxattr_count);
 	sorted_n[i] = NULL;
-	qsort(sorted_n, sharedxattr_count, sizeof(n), comp_shared_xattritem);
+	qsort(sorted_n, sharedxattr_count, sizeof(n), erofs_comp_xattritem);
 
 	buf = calloc(1, shared_xattrs_size);
 	if (!buf) {
@@ -1042,7 +1055,7 @@ int erofs_load_shared_xattrs_from_path(struct erofs_sb_info *sbi, const char *pa
 	xamgr->shared_xattrs = sorted_n[0];
 	free(sorted_n);
 	bh->op = &erofs_drop_directly_bhops;
-	ret = erofs_dev_write(sbi, buf, erofs_btell(bh, false), shared_xattrs_size);
+	ret = erofs_dev_write(sbi, 0, buf, erofs_btell(bh, false), shared_xattrs_size);
 	free(buf);
 	erofs_bdrop(bh, false);
 	return ret;
@@ -1091,10 +1104,10 @@ char *erofs_export_xattr_ibody(struct erofs_inode *inode)
 		item = node->item;
 		list_del(&node->list);
 
-		/* move inline xattrs to the onstack list */
+		/* move inline xattrs to the onstack list, order preserved */
 		if (item->shared_xattr_id < 0 ||
 		    header->h_shared_count >= UCHAR_MAX) {
-			list_add(&node->list, &ilst);
+			list_add_tail(&node->list, &ilst);
 			continue;
 		}
 
@@ -1121,6 +1134,17 @@ char *erofs_export_xattr_ibody(struct erofs_inode *inode)
 		return ERR_PTR(-EFAULT);
 	}
 	return buf;
+}
+
+void erofs_inode_free_xattrs(struct erofs_inode *inode)
+{
+	DBG_BUGON(inode->i_count > 0);
+
+	if (erofs_atomic_read(&inode->flags) & EROFS_I_EA_INITED) {
+		free(inode->xattr_shared_xattrs);
+		inode->xattr_shared_xattrs = NULL;
+		inode->xattr_shared_count = 0;
+	}
 }
 
 struct erofs_xattr_iter {
@@ -1410,8 +1434,8 @@ static int erofs_xattr_iter_shared(struct erofs_xattr_iter *it,
 	return ret;
 }
 
-int erofs_getxattr(struct erofs_inode *vi, const char *name, char *buffer,
-		   size_t buffer_size)
+int __erofs_getxattr(struct erofs_inode *vi, const char *name,
+		     char *buffer, size_t buffer_size, bool hidden)
 {
 	int ret;
 	unsigned int prefix, prefixlen;
@@ -1424,8 +1448,12 @@ int erofs_getxattr(struct erofs_inode *vi, const char *name, char *buffer,
 	if (ret)
 		return ret;
 
-	if (!erofs_xattr_prefix_matches(name, &prefix, &prefixlen))
-		return -ENODATA;
+	if (!erofs_xattr_prefix_matches(name, &prefix, &prefixlen)) {
+		if (!hidden)
+			return -ENODATA;
+		prefixlen = 0;
+		prefix = 0;
+	}
 	it.index = prefix;
 	it.name = name + prefixlen;
 	it.len = strlen(it.name);
@@ -1443,6 +1471,12 @@ int erofs_getxattr(struct erofs_inode *vi, const char *name, char *buffer,
 		ret = erofs_xattr_iter_shared(&it, vi, true);
 	erofs_put_metabuf(&it.buf);
 	return ret ? ret : it.buffer_ofs;
+}
+
+int erofs_getxattr(struct erofs_inode *vi, const char *name,
+		   char *buffer, size_t buffer_size)
+{
+	return __erofs_getxattr(vi, name, buffer, buffer_size, false);
 }
 
 int erofs_listxattr(struct erofs_inode *vi, char *buffer, size_t buffer_size)
@@ -1513,6 +1547,44 @@ int erofs_xattr_set_ishare_prefix(struct erofs_sb_info *sbi,
 	sbi->ishare_xattr_prefix_id = EROFS_XATTR_LONG_PREFIX | err;
 	erofs_sb_set_ishare_xattrs(sbi);
 	return 0;
+}
+
+char *erofs_xattr_get_ishare_prefix(struct erofs_sb_info *sbi)
+{
+	struct erofs_xattr_prefix_item *pf = NULL;
+	unsigned int idx, base_index;
+	size_t base_len, infix_len;
+	char *name;
+
+	if (!erofs_sb_has_ishare_xattrs(sbi))
+		return NULL;
+
+	if (sbi->ishare_xattr_prefix_id & EROFS_XATTR_LONG_PREFIX) {
+		idx = sbi->ishare_xattr_prefix_id & EROFS_XATTR_LONG_PREFIX_MASK;
+		if (idx >= sbi->xattr_prefix_count)
+			return NULL;
+
+		pf = &sbi->xattr_prefixes[idx];
+		base_index = pf->prefix->base_index;
+		infix_len = pf->infix_len;
+	} else {
+		base_index = sbi->ishare_xattr_prefix_id &
+			EROFS_XATTR_LONG_PREFIX_MASK;
+		infix_len = 0;
+	}
+	if (base_index >= ARRAY_SIZE(xattr_types))
+		return ERR_PTR(-EFSCORRUPTED);
+
+	base_len = xattr_types[base_index].prefix_len;
+	name = malloc(base_len + infix_len + 1);
+	if (!name)
+		return ERR_PTR(-ENOMEM);
+
+	memcpy(name, xattr_types[base_index].prefix, base_len);
+	if (infix_len)
+		memcpy(name + base_len, pf->prefix->infix, infix_len);
+	name[base_len + infix_len] = '\0';
+	return name;
 }
 
 void erofs_xattr_cleanup_name_prefixes(void)

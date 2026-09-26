@@ -218,6 +218,11 @@ typedef int64_t         s64;
 #define get_unaligned(ptr)	__get_unaligned_t(typeof(*(ptr)), (ptr))
 #define put_unaligned(val, ptr) __put_unaligned_t(typeof(*(ptr)), (val), (ptr))
 
+static inline u16 get_unaligned_le16(const void *p)
+{
+	return le16_to_cpu(__get_unaligned_t(__le16, p));
+}
+
 static inline u32 get_unaligned_le32(const void *p)
 {
 	return le32_to_cpu(__get_unaligned_t(__le32, p));
@@ -386,6 +391,15 @@ unsigned long __roundup_pow_of_two(unsigned long n)
 
 #define __erofs_stringify_1(x...)	#x
 #define __erofs_stringify(x...)		__erofs_stringify_1(x)
+
+#define check_add_overflow(a, b, d) ({		\
+	typeof(a) __a = (a);			\
+	typeof(b) __b = (b);			\
+	typeof(d) __d = (d);			\
+	(void) (&__a == &__b);			\
+	(void) (&__a == __d);			\
+	__builtin_add_overflow(__a, __b, __d);	\
+})
 
 #define check_sub_overflow(a, b, d) ({		\
 	typeof(a) __a = (a);			\

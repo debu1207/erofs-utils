@@ -9,7 +9,6 @@
 #include "erofs/list.h"
 #include "erofs/tar.h"
 #include "erofs/xattr.h"
-#include "erofs/blobchunk.h"
 #include "erofs/importer.h"
 #if defined(HAVE_SYS_SYSMACROS_H)
 #include <sys/sysmacros.h>
@@ -19,9 +18,10 @@
 #endif
 #include "liberofs_base64.h"
 #include "liberofs_cache.h"
+#include "liberofs_chunk.h"
 #include "liberofs_gzran.h"
 #include "liberofs_rebuild.h"
-#include "sha256.h"
+#include "liberofs_sha256.h"
 
 /* This file is a tape/volume header.  Ignore it on extraction.  */
 #define GNUTYPE_VOLHDR 'V'
@@ -487,7 +487,7 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 
 	while (p < buf + size) {
 		char *kv, *key, *value;
-		int len, n;
+		int len, n, j;
 		/* extended records are of the format: "LEN NAME=VALUE\n" */
 		ret = sscanf(p, "%d %n", &len, &n);
 		if (ret < 1 || len <= n || len > buf + size - p) {
@@ -514,20 +514,25 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 			value++;
 
 			if (!strncmp(kv, "path=", sizeof("path=") - 1)) {
-				int j = p - 1 - value;
 				free(eh->path);
+				if (!*value) {
+					eh->path = NULL;
+					continue;
+				}
+				j = p - 1 - value;
 				eh->path = strdup(value);
 				while (j && eh->path[j - 1] == '/')
 					eh->path[--j] = '\0';
 			} else if (!strncmp(kv, "linkpath=",
 					sizeof("linkpath=") - 1)) {
 				free(eh->link);
-				eh->link = strdup(value);
+				eh->link = *value ? strdup(value) : NULL;
 			} else if (!strncmp(kv, "mtime=",
 					sizeof("mtime=") - 1)) {
-				unsigned int ns = 0;
-				int digits = 0;
-
+				if (!*value) {
+					eh->use_mtime = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1) {
 					ret = -EIO;
@@ -535,6 +540,9 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 				}
 				eh->st.st_mtime = lln;
 				if (value[n] == '.') {
+					unsigned int ns = 0;
+					int digits = 0;
+
 					while (value[n + 1] >= '0' &&
 					       value[n + 1] <= '9') {
 						if (digits < 9)
@@ -566,14 +574,28 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 				eh->use_mtime = true;
 			} else if (!strncmp(kv, "size=",
 					sizeof("size=") - 1)) {
+				if (!*value) {
+					eh->use_size = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1 || value[n] != '\0') {
 					ret = -EIO;
 					goto out;
 				}
+				if (lln < 0) {
+					erofs_err("invalid negative size=%lld in PAX header",
+						  lln);
+					ret = -EFSCORRUPTED;
+					goto out;
+				}
 				eh->st.st_size = lln;
 				eh->use_size = true;
 			} else if (!strncmp(kv, "uid=", sizeof("uid=") - 1)) {
+				if (!*value) {
+					eh->use_uid = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1 || value[n] != '\0') {
 					ret = -EIO;
@@ -582,6 +604,10 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 				eh->st.st_uid = lln;
 				eh->use_uid = true;
 			} else if (!strncmp(kv, "gid=", sizeof("gid=") - 1)) {
+				if (!*value) {
+					eh->use_gid = false;
+					continue;
+				}
 				ret = sscanf(value, "%lld %n", &lln, &n);
 				if(ret < 1 || value[n] != '\0') {
 					ret = -EIO;
@@ -665,7 +691,7 @@ static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 	nblocks = DIV_ROUND_UP(inode->i_size, 1U << sbi->blkszbits);
 
-	ret = erofs_allocate_inode_bh_data(inode, nblocks, false);
+	ret = erofs_allocate_inode_bh_data(inode, nblocks, 0);
 	if (ret)
 		return ret;
 
@@ -679,7 +705,7 @@ static int tarerofs_write_uncompressed_file(struct erofs_inode *inode,
 				ret = -EIO;
 			break;
 		}
-		if (erofs_dev_write(sbi, buf,
+		if (erofs_dev_write(sbi, 0, buf,
 				    erofs_pos(sbi, inode->u.i_blkaddr) + pos,
 				    ret)) {
 			ret = -EIO;
@@ -858,6 +884,13 @@ out_eot:
 		st.st_size = tarerofs_parsenum(th->size, sizeof(th->size));
 		if (errno)
 			goto invalid_tar;
+	}
+
+	if ((s64)st.st_size < 0) {
+		erofs_err("invalid negative size=%lld @ %lld",
+			  (s64)st.st_size, tar_offset);
+		ret = -EFSCORRUPTED;
+		goto out;
 	}
 
 	if (th->typeflag <= '7' && !eh.path) {

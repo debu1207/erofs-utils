@@ -67,8 +67,9 @@ struct erofs_buffer_head;
 struct erofs_bufmgr;
 
 struct erofs_device_info {
-	char *src_path;
 	u8 tag[64];
+	char *src_path;
+	struct erofs_bufmgr *bmgr;
 	erofs_blk_t blocks;
 	erofs_blk_t uniaddr;
 };
@@ -89,15 +90,14 @@ struct erofs_mkfs_dfops;
 struct erofs_packed_inode;
 struct erofs_xattrmgr;
 struct z_erofs_mgr;
-struct erofs_metaboxmgr;
+struct erofs_metamgr;
+struct erofs_chunkmgr;
 
 struct erofs_sb_info {
 	struct erofs_sb_lz4_info lz4;
-	struct erofs_device_info *devs;
-	char *devname;
+	struct erofs_device_info *devs, dif0;
 
 	u64 total_blocks;
-	u64 primarydevice_blocks;
 
 	s32 meta_blkaddr;
 	u32 xattr_blkaddr;
@@ -123,10 +123,8 @@ struct erofs_sb_info {
 	u32 checksum;
 	u16 available_compr_algs;
 	u16 extra_devices;
-	union {
-		u16 devt_slotoff;		/* used for mkfs */
-		u16 device_id_mask;		/* used for others */
-	};
+	u16 devt_slotoff;
+	u16 device_id_mask;
 	erofs_nid_t packed_nid;
 	erofs_nid_t metabox_nid;
 
@@ -153,6 +151,7 @@ struct erofs_sb_info {
 	struct erofs_bufmgr *bmgr;
 	struct erofs_xattrmgr *xamgr;
 	struct z_erofs_mgr *zmgr;
+	struct erofs_chunkmgr *chunkmgr;
 	struct erofs_metamgr *m2gr, *mxgr;
 	struct erofs_packed_inode *packedinode;
 	struct erofs_buffer_head *bh_sb;
@@ -210,6 +209,11 @@ struct erofs_diskbuf;
 #define EROFS_INODE_DATA_SOURCE_RESVSP		3
 #define EROFS_INODE_DATA_SOURCE_REBUILD_BLOB	4
 
+enum erofs_idata_type {
+	EROFS_IDATA_TYPE_RAW,
+	EROFS_IDATA_TYPE_COMPRESSED_DEFAULT,
+};
+
 #define EROFS_I_BLKADDR_DEV_ID_BIT		48
 
 struct erofs_inode {
@@ -262,7 +266,7 @@ struct erofs_inode {
 	unsigned short idata_size;
 	char datasource;
 	bool in_metabox;
-	bool compressed_idata;
+	char idata_type;
 	bool lazy_tailblock;
 	bool opaque;
 	/* OVL: non-merge dir that may contain whiteout entries */
@@ -280,10 +284,6 @@ struct erofs_inode {
 	struct erofs_buffer_head *bh_inline, *bh_data;
 
 	void *idata;
-
-	/* (ztailpacking) in order to recover uncompressed EOF data */
-	void *eof_tailraw;
-	unsigned int eof_tailrawsize;
 
 	union {
 		void *chunkindexes;
@@ -454,12 +454,14 @@ void erofs_put_super(struct erofs_sb_info *sbi);
 int erofs_writesb(struct erofs_sb_info *sbi);
 struct erofs_buffer_head *erofs_reserve_sb(struct erofs_bufmgr *bmgr);
 int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices);
+int erofs_update_all_devices(struct erofs_sb_info *sbi);
 int erofs_write_device_table(struct erofs_sb_info *sbi);
 int erofs_enable_sb_chksum(struct erofs_sb_info *sbi, u32 *crc);
 int erofs_superblock_csum_verify(struct erofs_sb_info *sbi);
 int erofs_mkfs_format_fs(struct erofs_sb_info *sbi, unsigned int blkszbits,
 			 unsigned int dsunit, bool metazone);
 int erofs_mkfs_load_fs(struct erofs_sb_info *sbi, unsigned int dsunit);
+int erofs_flush_all_devices(struct erofs_sb_info *sbi);
 
 /* namei.c */
 int erofs_read_inode_from_disk(struct erofs_inode *vi);
@@ -507,6 +509,8 @@ static inline int erofs_get_occupied_size(const struct erofs_inode *inode,
 }
 
 /* data.c */
+int erofs_dev_write(struct erofs_sb_info *sbi, int device_id,
+		    const void *buf, u64 offset, size_t len);
 int erofs_getxattr(struct erofs_inode *vi, const char *name, char *buffer,
 		   size_t buffer_size);
 int erofs_listxattr(struct erofs_inode *vi, char *buffer, size_t buffer_size);
@@ -527,24 +531,10 @@ int erofs_blob_open_ro(struct erofs_sb_info *sbi, const char *dev);
 ssize_t erofs_dev_read(struct erofs_sb_info *sbi, int device_id,
 		       void *buf, u64 offset, size_t len);
 
-static inline int erofs_dev_write(struct erofs_sb_info *sbi, const void *buf,
-				  u64 offset, size_t len)
-{
-	if (erofs_io_pwrite(&sbi->bdev, buf, offset, len) != (ssize_t)len)
-		return -EIO;
-	return 0;
-}
-
-static inline int erofs_dev_resize(struct erofs_sb_info *sbi,
-				   erofs_blk_t blocks)
-{
-	return erofs_io_ftruncate(&sbi->bdev, (u64)blocks * erofs_blksiz(sbi));
-}
-
 static inline int erofs_blk_write(struct erofs_sb_info *sbi, const void *buf,
 				  erofs_blk_t blkaddr, u32 nblocks)
 {
-	return erofs_dev_write(sbi, buf, erofs_pos(sbi, blkaddr),
+	return erofs_dev_write(sbi, 0, buf, erofs_pos(sbi, blkaddr),
 			       erofs_pos(sbi, nblocks));
 }
 
@@ -571,7 +561,11 @@ extern const char *erofs_frags_packedname;
 
 static inline bool erofs_is_packed_inode(struct erofs_inode *inode)
 {
-	return inode->i_srcpath == EROFS_PACKED_INODE;
+	if (inode->i_srcpath == EROFS_PACKED_INODE)
+		return true;
+	return erofs_sb_has_fragments(inode->sbi) &&
+		inode->sbi->packed_nid > 0 &&
+		inode->nid == inode->sbi->packed_nid;
 }
 
 int erofs_packedfile_init(struct erofs_sb_info *sbi, bool fragments_mkfs);

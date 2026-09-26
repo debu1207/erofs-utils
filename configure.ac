@@ -185,6 +185,10 @@ AC_ARG_WITH(libnl3,
    [AS_HELP_STRING([--with-libnl3],
       [Enable and build with libnl3 support @<:@default=auto@:>@])])
 
+AC_ARG_ENABLE(ublk,
+   [AS_HELP_STRING([--enable-ublk], [enable ublk block device support @<:@default=no@:>@])],
+   [enable_ublk="$enableval"], [enable_ublk="no"])
+
 AC_ARG_ENABLE(s3,
    [AS_HELP_STRING([--enable-s3], [enable s3 image generation support @<:@default=no@:>@])],
    [enable_s3="$enableval"], [enable_s3="no"])
@@ -280,6 +284,7 @@ AC_CHECK_FUNCS(m4_flatten([
 	fallocate
 	getrandom
 	getrlimit
+	gettid
 	gettimeofday
 	lgetxattr
 	llistxattr
@@ -749,6 +754,29 @@ AS_IF([test "x$with_libnl3" != "xno"], [
   ])
 ])
 
+# Configure ublk (requires liburing)
+have_ublk="no"
+AS_IF([test "x$enable_ublk" = "xyes"], [
+  PKG_CHECK_MODULES([liburing], [liburing >= 2.0], [
+    # Paranoia: don't trust the result reported by pkgconfig before trying out
+    saved_LIBS="$LIBS"
+    saved_CPPFLAGS=${CPPFLAGS}
+    CPPFLAGS="${liburing_CFLAGS} ${CPPFLAGS}"
+    LIBS="${liburing_LIBS} $LIBS"
+    AC_CHECK_HEADERS([liburing.h],[
+      AC_CHECK_LIB(uring, io_uring_queue_init, [], [
+        AC_MSG_ERROR([liburing doesn't work properly])])
+      AC_CHECK_DECL(io_uring_queue_init, [have_ublk="yes"],
+        [AC_MSG_ERROR([liburing doesn't work properly])], [[
+#include <liburing.h>
+      ]])
+    ])
+    LIBS="${saved_LIBS}"
+    CPPFLAGS="${saved_CPPFLAGS}"], [
+    AC_MSG_ERROR([ublk requires liburing >= 2.0])
+  ])
+])
+
 AS_IF([test "x$enable_s3" != "xno"], [
   AS_IF(
     [test "x$have_libcurl" = "xyes" && \
@@ -789,6 +817,16 @@ AM_CONDITIONAL([ENABLE_S3], [test "x${have_s3}" = "xyes"])
 AM_CONDITIONAL([ENABLE_STATIC_FUSE], [test "x${enable_static_fuse}" = "xyes"])
 AM_CONDITIONAL([ENABLE_OCI], [test "x${have_oci}" = "xyes"])
 AM_CONDITIONAL([ENABLE_FANOTIFY], [test "x${have_fanotify}" = "xyes"])
+AM_CONDITIONAL([ENABLE_UBLK], [test "x${have_ublk}" = "xyes"])
+
+LIBEROFS_LIBS="${libselinux_LIBS} ${libuuid_LIBS} ${liblz4_LIBS} \
+${liblzma_LIBS} ${zlib_LIBS} ${libdeflate_LIBS} ${libzstd_LIBS} \
+${libqpl_LIBS} ${libxxhash_LIBS} ${libcurl_LIBS} ${openssl_LIBS} \
+${libxml2_LIBS} ${libnl3_LIBS} ${liburing_LIBS} ${json_c_LIBS}"
+AS_IF([test "x${enable_multithreading}" != "xno"], [
+  LIBEROFS_LIBS="${LIBEROFS_LIBS} -lpthread"
+])
+AC_SUBST([LIBEROFS_LIBS])
 
 if test "x$have_uuid" = "xyes"; then
   AC_DEFINE([HAVE_LIBUUID], 1, [Define to 1 if libuuid is found])
@@ -808,13 +846,6 @@ fi
 
 if test "x${have_liblzma}" = "xyes"; then
   AC_DEFINE([HAVE_LIBLZMA], [1], [Define to 1 if liblzma is enabled.])
-  liblzma_LIBS="-llzma"
-  test -z "${with_liblzma_libdir}" ||
-    liblzma_LIBS="-L${with_liblzma_libdir} $liblzma_LIBS"
-  test -z "${with_liblzma_incdir}" ||
-    liblzma_CFLAGS="-I${with_liblzma_incdir}"
-  AC_SUBST([liblzma_LIBS])
-  AC_SUBST([liblzma_CFLAGS])
 fi
 
 if test "x$have_zlib" = "xyes"; then
@@ -868,6 +899,12 @@ fi
 if test "x$have_fanotify" = "xyes"; then
   AC_DEFINE([EROFS_FANOTIFY_ENABLED], 1,
 	    [Define to 1 if fanotify backend is enabled])
+fi
+
+if test "x$have_ublk" = "xyes"; then
+  AC_DEFINE([HAVE_LIBURING], 1, [Define to 1 if liburing is found])
+  AC_SUBST([liburing_LIBS])
+  AC_SUBST([liburing_CFLAGS])
 fi
 
 # Dump maximum block size

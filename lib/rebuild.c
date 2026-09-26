@@ -12,9 +12,9 @@
 #include "erofs/inode.h"
 #include "erofs/dir.h"
 #include "erofs/xattr.h"
-#include "erofs/blobchunk.h"
 #include "erofs/internal.h"
 #include "erofs/io.h"
+#include "liberofs_chunk.h"
 #include "liberofs_rebuild.h"
 #include "liberofs_uuid.h"
 
@@ -152,7 +152,7 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 	return d;
 }
 
-static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
+static int erofs_rebuild_load_chunk_index(struct erofs_sb_info *dst_sb,
 					  struct erofs_inode *inode)
 {
 	int ret;
@@ -193,7 +193,7 @@ static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
 	inode->chunkindexes = idx;
 
 	for (i = 0; i < count; i++) {
-		struct erofs_blobchunk *chunk;
+		struct erofs_chunkitem *chunk;
 		struct erofs_map_blocks map = {
 			.buf = __EROFS_BUF_INITIALIZER,
 		};
@@ -204,7 +204,7 @@ static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
 			goto err;
 
 		blkaddr = erofs_blknr(dst_sb, map.m_pa);
-		chunk = erofs_get_unhashed_chunk(inode->dev, blkaddr, 0);
+		chunk = erofs_get_unhashed_chunk(dst_sb, inode->dev, blkaddr, 0);
 		if (IS_ERR(chunk)) {
 			ret = PTR_ERR(chunk);
 			goto err;
@@ -222,6 +222,17 @@ err:
 	return ret;
 }
 
+static int erofs_rebuild_write_blob_index(struct erofs_sb_info *dst_sb,
+					  struct erofs_inode *inode)
+{
+	int z_erofs_rebuild_load_metadata(struct erofs_sb_info *dst_sb,
+					  struct erofs_inode *inode);
+
+	if (is_inode_layout_compression(inode))
+		return z_erofs_rebuild_load_metadata(dst_sb, inode);
+	return erofs_rebuild_load_chunk_index(dst_sb, inode);
+}
+
 static int erofs_rebuild_write_full_data(struct erofs_inode *inode)
 {
 	struct erofs_sb_info *src_sbi = inode->sbi;
@@ -233,7 +244,7 @@ static int erofs_rebuild_write_full_data(struct erofs_inode *inode)
 				return -EFSCORRUPTED;
 			return 0;
 		}
-		inode->rebuild_blobpath = strdup(src_sbi->devname);
+		inode->rebuild_blobpath = strdup(src_sbi->dif0.src_path);
 		if (!inode->rebuild_blobpath)
 			return -ENOMEM;
 		inode->rebuild_src_dataoff =
@@ -244,7 +255,7 @@ static int erofs_rebuild_write_full_data(struct erofs_inode *inode)
 		unsigned int inline_size = inode->i_size % erofs_blksiz(src_sbi);
 
 		if (nblocks > 0 && inode->u.i_blkaddr != EROFS_NULL_ADDR) {
-			inode->rebuild_blobpath = strdup(src_sbi->devname);
+			inode->rebuild_blobpath = strdup(src_sbi->dif0.src_path);
 			if (!inode->rebuild_blobpath)
 				return -ENOMEM;
 			inode->rebuild_src_dataoff =
@@ -401,9 +412,17 @@ static int erofs_rebuild_dirent_iter(struct erofs_dir_context *ctx)
 			.nid = ctx->de_nid
 		};
 		ret = erofs_read_inode_from_disk(&src);
-		if (ret || !S_ISDIR(src.i_mode))
+		if (ret)
 			goto out;
 		mergedir = d->inode;
+		if (erofs_inode_is_whiteout(&src)) {
+			mergedir->opaque = true;
+			goto out;
+		}
+		if (!S_ISDIR(src.i_mode))
+			goto out;
+		mergedir->opaque |= erofs_get_opaque_from_disk(&src);
+		erofs_inode_free_xattrs(&src);
 		inode = dir = &src;
 	} else {
 		u64 nid;
@@ -489,10 +508,11 @@ out:
 int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
 			    enum erofs_rebuild_datamode mode)
 {
+	struct erofs_sb_info *dst_sbi = root->sbi;
 	struct erofs_inode inode = {};
 	struct erofs_rebuild_dir_context ctx;
 	char uuid_str[37];
-	char *fsid = sbi->devname;
+	char *fsid = sbi->dif0.src_path;
 	int ret;
 
 	if (!fsid) {
@@ -504,6 +524,21 @@ int erofs_rebuild_load_tree(struct erofs_inode *root, struct erofs_sb_info *sbi,
 	if (ret) {
 		erofs_err("failed to read superblock of %s", fsid);
 		return ret;
+	}
+
+	if (mode == EROFS_REBUILD_DATA_BLOB_INDEX) {
+		if (erofs_sb_has_ztailpacking(sbi))
+			erofs_sb_set_ztailpacking(dst_sbi);
+		if (erofs_sb_has_dedupe(sbi))
+			erofs_sb_set_dedupe(dst_sbi);
+		if (erofs_sb_has_big_pcluster(sbi) &&
+		    !erofs_sb_has_big_pcluster(dst_sbi)) {
+			erofs_err("failed to load tree from image %d with big pclusters",
+				  sbi->dev);
+			return -EOPNOTSUPP;
+		}
+		if (erofs_sb_has_48bit(sbi))
+			erofs_sb_set_48bit(dst_sbi);
 	}
 
 	inode.nid = sbi->root_nid;
